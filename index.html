@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>科室轮转打卡系统</title>
+<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;font-family:system-ui;}
+.wrap{max-width:500px;margin:20px auto;padding:15px;}
+.box{border:1px solid #e5e7eb;border-radius:10px;padding:20px;margin-bottom:16px;}
+.title{font-size:18px;font-weight:bold;margin-bottom:12px;}
+.err-box{background:#fee;border:1px solid #f88;padding:30px;text-align:center;color:#c00;font-size:20px;display:none;}
+.main-box{display:none;}
+.row{margin:12px 0;}
+label{display:block;margin-bottom:6px;font-size:14px;color:#444;}
+input,select{width:100%;padding:10px;border:1px solid #ddd;border-radius:6px;}
+button{padding:11px 0;width:100%;border:none;border-radius:6px;background:#2563eb;color:#fff;font-size:16px;margin-top:8px;cursor:pointer;}
+.export-area{background:#f8fafc;}
+#recordList{max-height:280px;overflow-y:auto;border:1px solid #eee;padding:10px;margin:10px 0;}
+.item{padding:6px 0;border-bottom:1px solid #eee;font-size:13px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+    <div id="errBox" class="err-box">❌ 访问拒绝：必须触碰科室NFC标签进入系统，禁止手动输入/收藏链接打开</div>
+    <div id="mainBox" class="main-box">
+        <div class="box">
+            <div class="title">打卡信息填写</div>
+            <div class="row">
+                <label>本人工号（白名单内编号）</label>
+                <input type="text" id="userCode" placeholder="填写工号">
+            </div>
+            <div class="row">
+                <label>当前打卡科室</label>
+                <input type="text" id="deptName" readonly placeholder="自动读取NFC科室">
+            </div>
+            <div class="row">
+                <label>打卡定位校验</label>
+                <div id="posText">正在获取定位...</div>
+            </div>
+            <div class="row">
+                <div>打卡类型：<span id="checkType">--</span></div>
+            </div>
+            <button id="submitBtn">提交本次打卡记录</button>
+        </div>
+
+        <div class="box export-area">
+            <div class="title">管理员数据导出（按时间段筛选）</div>
+            <div class="row" style="display:flex;gap:8px;">
+                <div style="flex:1">
+                    <label>开始日期</label>
+                    <input type="date" id="startDate">
+                </div>
+                <div style="flex:1">
+                    <label>结束日期</label>
+                    <input type="date" id="endDate">
+                </div>
+            </div>
+            <button id="exportBtn">导出该时间段打卡Excel文件</button>
+            <div id="recordList"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+// =====================【管理员集中配置区，只改这里即可】=====================
+// 1、所有NFC卡片UID白名单（阶段1收集的所有UID粘贴到此）
+const allowUidList = [
+    "538B1CCE330001",
+    "04B771CC223311"
+];
+// UID和科室一一对应
+const uidToDept = {
+    "538B1CCE330001":"＋",
+    "04B771CC223311":"护士站"
+};
+// 2、人员白名单：工号-姓名
+const userWhiteList = {
+    "001":"刘六六",
+    "002":"李四"
+};
+// 3、每个科室坐标+允许打卡半径(米)，高德/百度地图拾取科室门口经纬度
+const deptPosition = {
+    "+":{lat:29.362,lng:106.2929,r:15},
+    "护士站":{lat:29.4570,lng:106.5895,r:15}
+};
+// 打卡记录本地存储Key
+const STORAGE_KEY = "clock_record_data";
+// 设备绑定存储Key
+const DEVICE_BIND_KEY = "user_device_bind";
+// =====================================================================
+
+// 1、NFC参数校验
+const urlObj = new URL(window.location.href);
+const tagUid = urlObj.searchParams.get("tagUid");
+if(!tagUid || !allowUidList.includes(tagUid)){
+    document.getElementById("errBox").style.display = "block";
+}else{
+    document.getElementById("mainBox").style.display = "block";
+    document.getElementById("deptName").value = uidToDept[tagUid] || "未知科室";
+}
+
+// 2、设备一机一绑定校验
+function getDeviceId(){
+    let did = localStorage.getItem("local_device_id");
+    if(!did){
+        did = Math.random().toString(36).slice(2)+Date.now().toString(36);
+        localStorage.setItem("local_device_id",did);
+    }
+    return did;
+}
+const deviceId = getDeviceId();
+document.getElementById("userCode").addEventListener("blur",()=>{
+    const code = document.getElementById("userCode").value.trim();
+    if(!code)return;
+    const bindInfo = JSON.parse(localStorage.getItem(DEVICE_BIND_KEY)||"{}");
+    if(bindInfo[code] && bindInfo[code]!==deviceId){
+        alert("该工号已绑定其他手机设备，请联系管理员解绑");
+        document.getElementById("userCode").value = "";
+    }
+});
+
+// 3、GPS定位校验
+let nowLat = 0,nowLng = 0;
+function getDistance(lat1,lng1,lat2,lng2){
+    const R = 6371000;
+    const rad = Math.PI / 180;
+    const dLat = (lat2-lat1)*rad;
+    const dLng = (lng2-lng1)*rad;
+    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*rad)*Math.cos(lat2*rad)*Math.sin(dLng/2)**2;
+    return R * (2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a)));
+}
+navigator.geolocation.getCurrentPosition(pos=>{
+    nowLat = pos.coords.latitude;
+    nowLng = pos.coords.longitude;
+    const currDept = document.getElementById("deptName").value;
+    const cfg = deptPosition[currDept];
+    const dis = getDistance(nowLat,nowLng,cfg.lat,cfg.lng);
+    if(dis <= cfg.r){
+        document.getElementById("posText").innerText = `定位正常｜距离科室${dis.toFixed(1)}米`;
+    }else{
+        document.getElementById("posText").innerText = `定位异常｜超出打卡范围${dis.toFixed(1)}米，禁止打卡`;
+        document.getElementById("submitBtn").disabled = true;
+    }
+},err=>{document.getElementById("posText").innerText="获取定位失败，请开启手机定位权限"});
+
+// 4、自动判定打卡类型
+function getCheckType(){
+    const h = new Date().getHours();
+    const m = new Date().getMinutes();
+    const total = h*60+m;
+    if(total >= 6*60 && total <=8*60) return "上午上班打卡";
+    if(total >=11*60 && total <=13*60) return "上午下班打卡";
+    if(total >=13*60 && total <=14*60) return "下午上班打卡";
+    if(total >=17*60 && total <=19*60) return "下午下班打卡";
+    return "补卡";
+}
+document.getElementById("checkType").innerText = getCheckType();
+
+// 5、提交打卡存入LocalStorage
+document.getElementById("submitBtn").addEventListener("click",()=>{
+    const userCode = document.getElementById("userCode").value.trim();
+    const dept = document.getElementById("deptName").value;
+    const posText = document.getElementById("posText").innerText;
+    if(!userWhiteList[userCode]){alert("工号不在白名单内，无法打卡");return;}
+    if(posText.includes("超出打卡范围") || posText.includes("获取定位失败")){alert("定位校验不通过");return;}
+    // 绑定设备
+    const bindInfo = JSON.parse(localStorage.getItem(DEVICE_BIND_KEY)||"{}");
+    bindInfo[userCode] = deviceId;
+    localStorage.setItem(DEVICE_BIND_KEY,JSON.stringify(bindInfo));
+    // 组装打卡数据
+    const now = new Date();
+    const record = {
+        id: now.getTime(),
+        userName: userWhiteList[userCode],
+        userCode: userCode,
+        dept: dept,
+        checkType: getCheckType(),
+        checkTime: now.toLocaleString("zh-CN"),
+        timestamp: now.getTime(),
+        lat: nowLat,
+        lng: nowLng,
+        deviceId: deviceId
+    };
+    // 存入本地存储
+    const allData = JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]");
+    allData.push(record);
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(allData));
+    alert("打卡提交成功");
+    renderRecordList();
+});
+
+// 渲染打卡列表
+function renderRecordList(){
+    const list = JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]");
+    let html = "";
+    list.sort((a,b)=>b.timestamp - a.timestamp).forEach(item=>{
+        html += `<div class="item">${item.checkTime} | ${item.userName} | ${item.dept} | ${item.checkType}</div>`;
+    });
+    document.getElementById("recordList").innerHTML = html || "暂无打卡记录";
+}
+renderRecordList();
+
+// 6、按起止日期筛选导出Excel
+document.getElementById("exportBtn").addEventListener("click",()=>{
+    const sDate = document.getElementById("startDate").value;
+    const eDate = document.getElementById("endDate").value;
+    if(!sDate || !eDate){alert("请选择起止日期");return;}
+    const s = new Date(sDate).getTime();
+    const e = new Date(eDate).getTime() + 86400000;
+    const allData = JSON.parse(localStorage.getItem(STORAGE_KEY)||"[]");
+    const filterData = allData.filter(item=>item.timestamp >= s && item.timestamp <= e);
+    if(filterData.length === 0){alert("所选时间段无打卡数据");return;}
+    // 生成Excel
+    const ws = XLSX.utils.json_to_sheet(filterData);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"打卡记录表");
+    const excelBuf = XLSX.write(wb,{bookType:"xlsx",type:"array"});
+    const blob = new Blob([excelBuf],{type:"application/octet-stream"});
+    saveAs(blob,`打卡数据_${sDate}_${eDate}.xlsx`);
+});
+</script>
+</body>
+</html>
